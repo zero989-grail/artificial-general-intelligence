@@ -1,0 +1,283 @@
+# ==== Imports ====
+import gymnasium as gym
+import matplotlib.pyplot as plt
+import numpy as np
+import random, math
+from dataclasses import dataclass
+from collections import deque
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
+
+# ---- MiniGrid wrapper ----
+try:
+    # Changed import path from minigrid.wrappers to gymnasium_minigrid.wrappers
+    from gymnasium_minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
+    WrapperClass = ImgObsWrapper
+except ImportError:
+    # Changed import path from minigrid.wrappers to gymnasium_minigrid.wrappers
+    from gymnasium_minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
+    WrapperClass = RGBImgObsWrapper
+
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+# ==== Config ====
+@dataclass
+class Config:
+    env_id: str = "MiniGrid-DoorKey-5x5-v0"
+    n_envs: int = 8
+    hidden_size: int = 256
+    lr: float = 2.5e-4
+    gamma: float = 0.99
+    lam: float = 0.95
+    clip_coef: float = 0.2
+    vf_coef: float = 0.5
+    ent_coef: float = 0.01
+    max_grad_norm: float = 0.5
+    alpha_bi: float = 1.0
+    beta_cad: float = 0.1
+    lambda_complexity: float = 0.01
+    rollout_len: int = 128
+    update_epochs: int = 4
+    minibatch_size: int = 2048
+    log_every_env_steps: int = 2048  # frequent logging for smoke test
+
+cfg = Config()
+
+# ==== PPOAgent ====
+class PPOAgent(nn.Module):
+    def __init__(self, obs_shape, n_actions, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        hidden = cfg.hidden_size
+        flat_obs = int(np.prod(obs_shape))
+
+        self.encoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flat_obs, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+        self.action_embed = nn.Embedding(n_actions, hidden // 2)
+        self.forward_pred = nn.Sequential(
+            nn.Linear(hidden + (hidden // 2), hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.inverse_pred = nn.Sequential(
+            nn.Linear(2 * hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, n_actions),
+        )
+        self.policy = nn.Linear(hidden, n_actions)
+        self.value  = nn.Linear(hidden, 1)
+
+    def encode(self, obs): return self.encoder(obs.float())
+
+    def act(self, obs):
+        z = self.encode(obs)
+        logits = self.policy(z)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        logp = dist.log_prob(action)
+        v = self.value(z).squeeze(-1)   # return value
+        return action, logp, v
+
+    def evaluate(self, obs, actions):
+        z = self.encode(obs)
+        logits = self.policy(z)
+        dist = Categorical(logits=logits)
+        logp = dist.log_prob(actions)
+        entropy = dist.entropy()
+        v = self.value(z).squeeze(-1)
+        return logp, entropy, v, z, logits
+
+    def ppo_loss(self, batch, old_logp, advantages, returns):
+        logp, entropy, v, _, _ = self.evaluate(batch["obs"], batch["actions"])
+        ratio = torch.exp(logp - old_logp)
+        clip_adv = torch.clamp(ratio, 1.0 - self.cfg.clip_coef, 1.0 + self.cfg.clip_coef) * advantages
+        pg_loss = -(torch.min(ratio * advantages, clip_adv)).mean()
+        v_loss = F.mse_loss(v, returns)
+        ent_loss = -entropy.mean()
+        total = pg_loss + self.cfg.vf_coef * v_loss + self.cfg.ent_coef * ent_loss
+        aux = {"pg": pg_loss.item(), "v": v_loss.item(), "ent": (-ent_loss).item()}
+        return total, aux
+
+# ==== FinalGiftAgent ====
+class FinalGiftAgent(PPOAgent):
+    def __init__(self, obs_shape, n_actions, cfg: Config):
+        super().__init__(obs_shape, n_actions, cfg)
+        self.register_buffer("cad_ema", torch.zeros((), dtype=torch.float32))
+        self._nA = n_actions
+        self._log_nA = math.log(float(n_actions))
+
+    def gi_terms(self, obs_t, obs_tp1, actions, z_t=None, z_tp1=None):
+        if z_t is None: z_t = self.encode(obs_t)
+        if z_tp1 is None: z_tp1 = self.encode(obs_tp1)
+        a_idx = actions.clamp_min(0).clamp_max(self._nA - 1).long()
+        a_emb = self.action_embed(a_idx)
+
+        z_pred = self.forward_pred(torch.cat([z_t, a_emb], dim=-1))
+        mse = F.mse_loss(z_pred, z_tp1, reduction="none").mean(dim=-1)
+        A = torch.exp(-mse)
+
+        inv_logits = self.inverse_pred(torch.cat([z_t, z_tp1], dim=-1))
+        inv_loss = F.cross_entropy(inv_logits, a_idx, reduction="none")
+        D = torch.clamp((self._log_nA - inv_loss), min=0.0) / self._log_nA
+        BI = A * D
+
+        with torch.no_grad():
+            z_center = z_t.mean(dim=0, keepdim=True)
+            spread = (z_t - z_center).pow(2).sum(dim=-1).mean().sqrt()
+        delta_cad = torch.clamp(spread - self.cad_ema, min=0.0)
+        with torch.no_grad():
+            self.cad_ema.add_(0.05 * (spread - self.cad_ema))
+
+        c_reg = torch.zeros((), device=z_t.device)
+        for p in list(self.encoder.parameters()) + list(self.forward_pred.parameters()) + list(self.inverse_pred.parameters()):
+            c_reg += p.pow(2).sum()
+        C = c_reg / 1e6
+
+        metrics = {"A_mean": A.mean().item(), "D_mean": D.mean().item(),
+                   "BI_mean": BI.mean().item(), "delta_cad": float(delta_cad.item()),
+                   "C": float(C.item())}
+        return BI.mean(), delta_cad, C, metrics
+
+    def ppo_gi_loss(self, batch, old_logp, advantages, returns):
+        logp, entropy, v, z_t, _ = self.evaluate(batch["obs"], batch["actions"])
+        ratio = torch.exp(logp - old_logp)
+        clip_adv = torch.clamp(ratio, 1.0 - self.cfg.clip_coef, 1.0 + self.cfg.clip_coef) * advantages
+        pg_loss = -(torch.min(ratio * advantages, clip_adv)).mean()
+        v_loss = F.mse_loss(v, returns)
+        ent_loss = -entropy.mean()
+        BI_mean, delta_cad, C_reg, metrics = self.gi_terms(batch["obs"], batch["obs_next"], batch["actions"], z_t=z_t)
+        gi_bonus = self.cfg.alpha_bi * BI_mean + self.cfg.beta_cad * delta_cad
+        gi_loss = -(gi_bonus) + self.cfg.lambda_complexity * C_reg
+        total = pg_loss + self.cfg.vf_coef * v_loss + self.cfg.ent_coef * ent_loss + gi_loss
+        aux = {"pg": pg_loss.item(), "v": v_loss.item(), "ent": (-ent_loss).item(),
+               "gi_bonus": float(gi_bonus.item()), **metrics}
+        return total, aux
+
+# ==== Rollout buffer + GAE ====
+class RolloutBuffer:
+    def __init__(self, T, B):
+        self.data = {"obs": [], "obs_next": [], "actions": [], "rewards": [], "dones": []}
+    def add(self, **kwargs):
+        for k,v in kwargs.items(): self.data[k].append(v)
+    def stack(self):
+        return {k: torch.stack(v, dim=0) for k,v in self.data.items()}
+
+def compute_gae(rewards, values, dones, gamma, lam):
+    T, B = rewards.shape
+    adv = np.zeros((T, B), dtype=np.float32)
+    gae = np.zeros(B, dtype=np.float32)
+    for t in reversed(range(T)):
+        delta = rewards[t] + gamma * values[t+1] * (1 - dones[t]) - values[t]
+        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        adv[t] = gae
+    ret = adv + values[:-1]
+    return adv, ret
+
+# ==== Trainer ====
+def ppo_train_minigrid(agent_name, envs, agent_kind="ppo", steps=100_000, seed=0, cfg: Config=cfg):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    vec = hasattr(envs, 'num_envs')
+    if vec:
+        B = envs.num_envs
+        n_actions = envs.single_action_space.n
+        obs0 = envs.reset(seed=seed)[0]
+    else:
+        B = len(envs); n_actions = envs[0].action_space.n
+        obs0 = envs[0].reset(seed=seed)[0]
+    if isinstance(obs0, dict) and "image" in obs0: obs0 = obs0["image"]
+    obs_shape = obs0.shape[1:] if len(obs0.shape)==4 else obs0.shape
+    agent = FinalGiftAgent(obs_shape, n_actions, cfg).to(DEVICE) if agent_kind=="finalgift" else PPOAgent(obs_shape, n_actions, cfg).to(DEVICE)
+    opt = torch.optim.Adam(agent.parameters(), lr=cfg.lr)
+    obs_np = envs.reset(seed=seed)[0] if vec else np.array([env.reset(seed=seed+i)[0] for i,env in enumerate(envs)])
+    cur_ep_ret = np.zeros(B, dtype=np.float32); recent_ep_returns = deque(maxlen=200)
+    logs={"step":[],"return_mean":[],"A":[],"D":[],"BI":[],"delta_cad":[]}
+    t_env=0
+    while t_env < steps:
+        T=cfg.rollout_len; buf=RolloutBuffer(T,B); values_seq=[]; rewards_seq=[]; dones_seq=[]; logp_seq=[]
+        for t in range(T):
+            obs_t=torch.tensor(obs_np,device=DEVICE)
+            with torch.no_grad(): a_t,logp_t,v_t=agent.act(obs_t)
+            a_np=a_t.cpu().numpy(); v_np=v_t.detach().cpu().numpy()
+            values_seq.append(v_np); logp_seq.append(logp_t.detach().cpu())
+            if vec:
+                obs_next_np,rewards,terminated,truncated,info=envs.step(a_np)
+                dones=np.logical_or(terminated,truncated).astype(np.float32)
+            else:
+                obs_next_np=[]; rewards=[]; dones=[]
+                for i,env in enumerate(envs):
+                    o,r,term,trunc,_=env.step(a_np[i])
+                    obs_next_np.append(o); rewards.append(r); dones.append(term or trunc)
+                obs_next_np=np.array(obs_next_np); rewards=np.array(rewards,dtype=np.float32); dones=np.array(dones,dtype=np.float32)
+            cur_ep_ret+=rewards
+            for i in np.where(dones>0.5)[0]: recent_ep_returns.append(cur_ep_ret[i].item()); cur_ep_ret[i]=0.0
+            buf.add(obs=torch.tensor(obs_np),actions=torch.tensor(a_np,dtype=torch.long),
+                    obs_next=torch.tensor(obs_next_np),rewards=torch.tensor(rewards,dtype=torch.float32),
+                    dones=torch.tensor(dones,dtype=torch.float32))
+            obs_np=obs_next_np; rewards_seq.append(rewards); dones_seq.append(dones); t_env+=B
+        with torch.no_grad():
+            z_last=agent.encode(torch.tensor(obs_np,device=DEVICE))
+            v_last=agent.value(z_last).squeeze(-1).cpu().numpy()
+        values_arr=np.stack(values_seq+[v_last],axis=0)
+        rewards_arr=np.stack(rewards_seq,axis=0); dones_arr=np.stack(dones_seq,axis=0).astype(np.float32)
+        adv,ret=compute_gae(rewards_arr,values_arr,dones_arr,cfg.gamma,cfg.lam)
+        adv_t=torch.tensor(adv.reshape(-1),device=DEVICE); ret_t=torch.tensor(ret.reshape(-1),device=DEVICE)
+        batch=buf.stack(); obs_b=batch["obs"].to(DEVICE).reshape(-1,*obs_shape)
+        obsn_b=batch["obs_next"].to(DEVICE).reshape(-1,*obs_shape); act_b=batch["actions"].to(DEVICE).reshape(-1)
+        old_logp_t=torch.stack(logp_seq,dim=0).reshape(-1).to(DEVICE)
+        adv_t=(adv_t-adv_t.mean())/(adv_t.std()+1e-8); idx=torch.randperm(adv_t.numel(),device=DEVICE)
+        for _ in range(cfg.update_epochs):
+            for i0 in range(0,idx.numel(),cfg.minibatch_size):
+                sel=idx[i0:i0+cfg.minibatch_size]
+                mb={"obs":obs_b[sel],"obs_next":obsn_b[sel],"actions":act_b[sel]}
+                mb_adv,mb_ret,mb_old_logp=adv_t[sel],ret_t[sel],old_logp_t[sel]
+                if isinstance(agent,FinalGiftAgent): loss,aux=agent.ppo_gi_loss(mb,mb_old_logp,mb_adv,mb_ret)
+                else: loss,aux=agent.ppo_loss(mb,mb_old_logp,mb_adv,mb_ret)
+                opt.zero_grad(set_to_none=True); loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.parameters(),max_norm=cfg.max_grad_norm); opt.step()
+        if t_env % cfg.log_every_env_steps==0:
+            mean_return=float(np.mean(recent_ep_returns)) if len(recent_ep_returns)>0 else 0.0
+            logs["step"].append(int(t_env)); logs["return_mean"].append(mean_return)
+            if isinstance(agent,FinalGiftAgent):
+                logs["A"].append(aux.get("A_mean",float("nan"))); logs["D"].append(aux.get("D_mean",float("nan")))
+                logs["BI"].append(aux.get("BI_mean",float("nan"))); logs["delta_cad"].append(aux.get("delta_cad",float("nan")))
+            else:
+                logs["A"].append(float("nan")); logs["D"].append(float("nan"))
+                logs["BI"].append(float("nan")); logs["delta_cad"].append(float("nan"))
+            print(f"[{agent_name}] step={t_env} return_mean={mean_return:.3f} aux={aux}")
+    return logs,agent
+
+# ==== Curriculum builder ====
+@dataclass
+class ProbEnv: id: str; p: float
+train_mix=[ProbEnv("MiniGrid-DoorKey-5x5-v0",0.35),
+           ProbEnv("MiniGrid-DoorKey-6x6-v0",0.30),
+           ProbEnv("MiniGrid-DoorKey-8x8-v0",0.25),
+           ProbEnv("MiniGrid-MultiRoom-N2-S4-v0",0.08),
+           ProbEnv("MiniGrid-MultiRoom-N4-S5-v0",0.02)]
+
+def sample_env_id(mix):
+    r=random.random(); acc=0.0
+    for e in mix:
+        acc+=e.p
+        if r<=acc: return e.id
+    return mix[-1].id
+
+def make_curriculum_vec_env(cfg, seed=0):
+    def make_one(worker_id):
+        def thunk():
+            env_id=sample_env_id(train_mix)
+            env=gym.make(env_id, render_mode=None)
+            env.reset(seed=seed+worker_id)
+            return WrapperClass(env)
+        return thunk
+    return gym.vector.AsyncVectorEnv([make_one(i) for i in range(cfg.n_envs)])
